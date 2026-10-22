@@ -108,6 +108,58 @@ class H2ReviewSuite extends Http4sSuite {
     }
   }
 
+  test("reproduce uncancellable deadlock".only) {
+    val shutdownServerDelay = 1.second
+    val app = HttpApp[IO](_ => Response[IO](Status.Ok).pure[IO])
+    val server = EmberServerBuilder
+      .default[IO]
+      .withHost(ipv4"127.0.0.1")
+      .withPort(port"0")
+      .withHttp2
+      // Drop the connection as soon as we stop the server.
+      // This causes a Broken Pipe exception to be raised in the client's write loop.
+      .withShutdownTimeout(0.seconds)
+      .withHttpApp(app)
+      .build
+    val client = EmberClientBuilder
+      .default[IO]
+      .withHttp2
+      .build
+
+    Deferred[IO, Port]
+      .flatMap { port =>
+        // Start the server, then stop it after a second.
+        val startAndShutdownServer = server.use { server =>
+          port.complete(server.addressIp4s.port) >> IO.sleep(shutdownServerDelay)
+        }
+
+        val runClient = client.use { client =>
+          // Wait for the server to start
+          port.get.flatMap { port =>
+            val uri = Uri.unsafeFromString(s"http://127.0.0.1:${port.value}/")
+            val req = Request[IO](Method.POST, uri)
+              .withEntity("Somebody")
+              .withAttribute(Http2PriorKnowledge, ())
+            // Make a request to open the connection
+            val makeFirstReq = client.expect[String](req)
+            val waitForServerToShutdown = IO.sleep(shutdownServerDelay)
+            // Before the connection is reaped, make enough requests to fill up the write queue
+            val makeManyConcurrentRequests = Stream[IO, Request[IO]](req)
+              .repeatN(60)
+              .parEvalMapUnbounded(client.expect[String])
+              .compile
+              .drain
+            makeFirstReq >> waitForServerToShutdown >> makeManyConcurrentRequests
+          }
+        }
+        (startAndShutdownServer, runClient).parTupled.void
+      }
+      // The test doesn't timeout because resource finalizers are blocked on the write queue.
+      .timeout(5.seconds)
+      .attempt
+      .void
+  }
+
   test("fail request when server socket closes") {
     val shutdownServerDelay = 1.second
     // Do not send a response. The server will stop before sending any data.
